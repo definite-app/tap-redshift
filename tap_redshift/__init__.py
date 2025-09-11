@@ -17,6 +17,7 @@
 # This product includes software developed at
 # data.world, Inc.(http://data.world/).
 
+import ast
 import copy
 import secrets
 import time
@@ -86,13 +87,16 @@ def table_spec_to_dict(table_spec):
 
 def transform_db_schema_type(db_schemas):
     """Converts db_schemas for querying."""
-    if type(db_schemas) == str:
-        return f"('{db_schemas}')"
-    elif type(db_schemas) == list:
-        if len(db_schemas) >= 2:
-            return tuple(db_schemas)
-        else:
-            return f"('{db_schemas[0]}')"
+    if  type(db_schemas) == str:
+        try:
+            db_schemas = ast.literal_eval(db_schemas)
+        except Exception as e:
+            LOGGER.error(f"Schemas config should be a list (['schema1', 'schema2']): {e}")
+            raise e
+    if len(db_schemas) >= 2:
+        return tuple(db_schemas)
+    else:
+        return f"('{db_schemas[0]}')"
 
 
 def discover_catalog(conn, db_name, db_schemas):
@@ -540,7 +544,7 @@ def main_impl():
     args = utils.parse_args(REQUIRED_CONFIG_KEYS)
     CONFIG.update(args.config)
     connection = open_connection(args.config)
-    db_schema = args.config.get('schema', 'public')
+    db_schema = args.config.get('schema', ['public'])
     db_name = args.config.get('dbname', 'dev')
     if args.discover:
         do_discover(connection, db_name, db_schema)
