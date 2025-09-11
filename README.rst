@@ -32,7 +32,7 @@ The json file requires the following attributes;
 * ``password``
 * ``start_date`` (Notation: yyyy-mm-ddThh:mm:ssZ)
 
-And an optional attribute;
+And an optional array of schemas (defaults to `public` if not provided);
 
 * ``schema``
 
@@ -47,7 +47,7 @@ Example:
         "user": "REDSHIFT_USER",
         "password": "REDSHIFT_PASSWORD",
         "start_date": "REDSHIFT_START_DATE",
-        "schema": "REDSHIFT_SCHEMA"
+        "schema": ["REDSHIFT_SCHEMA1", "REDSHIFT_SCHEMA2"]
     }
 
 
