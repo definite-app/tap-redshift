@@ -87,6 +87,26 @@ def get_selected_properties(catalog_entry):
             or properties[k].selected)}
 
 
+def merge_metadata(discovered_metadata, provided_metadata):
+    """Additively merge user-provided metadata into discovered metadata.
+
+    - Preserves all discovered metadata keys
+    - Overlays any keys present in the provided metadata
+    """
+    base = metadata.to_map(discovered_metadata) if discovered_metadata else metadata.new()
+    if provided_metadata:
+        overlay = metadata.to_map(provided_metadata)
+        is_view = metadata.get(base, (), 'is-view')
+        for breadcrumb, attrs in overlay.items():
+            for key, value in attrs.items():
+                # Normalize key-properties -> table/view-key-properties
+                normalized_key = key
+                if breadcrumb == () and key == 'key-properties':
+                    normalized_key = 'view-key-properties' if is_view else 'table-key-properties'
+                base = metadata.write(base, breadcrumb, normalized_key, value)
+    return metadata.to_list(base)
+
+
 def resolve_catalog(discovered, catalog, state):
     streams = list(filter(entry_is_selected, catalog.streams))
 
@@ -122,7 +142,7 @@ def resolve_catalog(discovered, catalog, state):
             stream=catalog_entry.stream,
             table=catalog_entry.table,
             schema=schema,
-            metadata=catalog_entry.metadata,
+            metadata=merge_metadata(discovered_table.metadata, catalog_entry.metadata),
             database=catalog_entry.database
         ))
 
