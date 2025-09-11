@@ -167,8 +167,7 @@ def discover_catalog(conn, db_name, db_schemas):
             table_spec_dict.get(table_name)['table_schema'],
             table_name,
         )
-        tap_stream_id = '{}-{}'.format(
-            db_name, qualified_table_name)
+        tap_stream_id = qualified_table_name # We only connect to one database at a time, can just name the stream the table name
 
         entry = CatalogEntry(
             tap_stream_id=tap_stream_id,
