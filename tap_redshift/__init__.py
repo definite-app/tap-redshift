@@ -171,7 +171,7 @@ def discover_catalog(conn, db_name, db_schemas):
 
         entry = CatalogEntry(
             tap_stream_id=tap_stream_id,
-            stream=table_name,
+            stream=qualified_table_name,
             schema=schema,
             table=qualified_table_name,
             metadata=metadata,
