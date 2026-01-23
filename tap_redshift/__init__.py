@@ -20,7 +20,9 @@
 import ast
 import copy
 import secrets
+import signal
 import time
+import traceback
 from itertools import groupby
 
 import pendulum
@@ -73,14 +75,16 @@ DATETIME_TYPES = {'timestamp', 'timestamptz',
 
 CONFIG = {}
 
-ROWS_PER_NETWORK_CALL = 40_000
+ROWS_PER_NETWORK_CALL = 10_000
 
 
 def table_spec_to_dict(table_spec):
-    """Converts table_spec results to a dictionary with table names as keys."""
+    """Converts table_spec results to a dictionary with (schema, table) as keys."""
     table_spec_dict = {}
     for table in table_spec:
-        table_spec_dict[table[0]] = {'table_type': table[1], 'table_schema': table[2]}
+        # Use (schema_name, table_name) tuple as key to handle same table names in different schemas
+        key = (table[2], table[0])  # (schema_name, table_name)
+        table_spec_dict[key] = {'table_type': table[1], 'table_schema': table[2]}
     LOGGER.info(f"table_spec_dict: {table_spec_dict}")
     return table_spec_dict
 
@@ -114,20 +118,20 @@ def discover_catalog(conn, db_name, db_schemas):
     column_specs = select_all(
         conn,
         f"""
-            SELECT DISTINCT c.table_name, c.ordinal_position, c.column_name, c.data_type,
+            SELECT DISTINCT c.schema_name, c.table_name, c.ordinal_position, c.column_name, c.data_type,
             CASE WHEN c.is_nullable = '' THEN 'YES' ELSE c.is_nullable END AS is_nullable
             FROM SVV_ALL_TABLES t
             JOIN SVV_ALL_COLUMNS c
             ON c.table_name = t.table_name AND c.schema_name = t.schema_name AND c.database_name = t.database_name
             WHERE t.schema_name in {db_schemas} and t.database_name = '{db_name}'
-            ORDER BY c.table_name, c.ordinal_position
+            ORDER BY c.schema_name, c.table_name, c.ordinal_position
         """
     )
 
     pk_specs = select_all(
         conn,
         f"""
-        SELECT kc.table_name, kc.column_name
+        SELECT kc.table_schema, kc.table_name, kc.column_name
         FROM information_schema.table_constraints tc
         JOIN information_schema.key_column_usage kc
             ON kc.table_name = tc.table_name AND
@@ -142,29 +146,34 @@ def discover_catalog(conn, db_name, db_schemas):
         """
     )
     entries = []
-    table_columns = [{'name': k, 'columns': [
-        {'pos': t[1], 'name': t[2], 'type': t[3], 'nullable': t[4], } for t in v
-    ]} for k, v in groupby(column_specs, key=lambda t: t[0])]
-    table_pks = {k: [t[1] for t in v]
-                 for k, v in groupby(pk_specs, key=lambda t: t[0])}
+    # Group by (schema_name, table_name) tuple to handle same table names in different schemas
+    # column_specs indices: 0=schema_name, 1=table_name, 2=ordinal_position, 3=column_name, 4=data_type, 5=is_nullable
+    table_columns = [{'schema': k[0], 'name': k[1], 'columns': [
+        {'pos': t[2], 'name': t[3], 'type': t[4], 'nullable': t[5], } for t in v
+    ]} for k, v in groupby(column_specs, key=lambda t: (t[0], t[1]))]
+    # pk_specs indices: 0=table_schema, 1=table_name, 2=column_name
+    table_pks = {k: [t[2] for t in v]
+                 for k, v in groupby(pk_specs, key=lambda t: (t[0], t[1]))}
     table_spec_dict = table_spec_to_dict(table_spec)
 
     for items in table_columns:
+        schema_name = items['schema']
         table_name = items['name']
+        table_key = (schema_name, table_name)
 
         cols = items['columns']
         schema = Schema(type='object',
                         properties={
                             c['name']: schema_for_column(c) for c in cols})
         key_properties = [
-            column for column in table_pks.get(table_name, [])
+            column for column in table_pks.get(table_key, [])
             if schema.properties[column].inclusion != 'unsupported']
-        is_view = table_spec_dict.get(table_name)['table_type'] == 'VIEW'
+        is_view = table_spec_dict.get(table_key)['table_type'] == 'VIEW'
         db_name = conn.get_dsn_parameters()['dbname']
         metadata = create_column_metadata(
             db_name, cols, is_view, table_name, key_properties)
         qualified_table_name = '{}-{}'.format(
-            table_spec_dict.get(table_name)['table_schema'],
+            schema_name,
             table_name,
         )
         tap_stream_id = qualified_table_name # We only connect to one database at a time, can just name the stream the table name
@@ -402,30 +411,42 @@ def sync_table(connection, catalog_entry, state):
         LOGGER.info('Running {}'.format(query_string))
 
         cursor.itersize = ROWS_PER_NETWORK_CALL
+        # LOGGER.info('About to execute cursor')
         cursor.execute(select, params)
+        # LOGGER.info('Cursor executed, starting iteration')
         rows_saved = 0
+        # LOGGER.info('About to enter metrics context')
+        try:
+            with metrics.record_counter(None) as counter:
+                # LOGGER.info('Inside metrics context')
+                counter.tags['database'] = catalog_entry.database
+                counter.tags['table'] = catalog_entry.table
+                # LOGGER.info('Entering cursor loop')
+                for row in cursor:
+                    # LOGGER.info(f'Got row {rows_saved + 1}')
+                    counter.increment()
+                    rows_saved += 1
+                    # LOGGER.info(f"rows saved: {rows_saved}")
+                    record_message = row_to_record(catalog_entry,
+                                                   stream_version,
+                                                   row,
+                                                   columns,
+                                                   time_extracted)
+                    yield record_message
 
-        with metrics.record_counter(None) as counter:
-            counter.tags['database'] = catalog_entry.database
-            counter.tags['table'] = catalog_entry.table
-            for row in cursor:
-                counter.increment()
-                rows_saved += 1
-                record_message = row_to_record(catalog_entry,
-                                               stream_version,
-                                               row,
-                                               columns,
-                                               time_extracted)
-                yield record_message
-
-                if replication_key is not None:
-                    state = singer.write_bookmark(state,
-                                                  tap_stream_id,
-                                                  'replication_key_value',
-                                                  record_message.record[
-                                                      replication_key])
-                if rows_saved % 1000 == 0:
-                    yield singer.StateMessage(value=copy.deepcopy(state))
+                    if replication_key is not None:
+                        state = singer.write_bookmark(state,
+                                                      tap_stream_id,
+                                                      'replication_key_value',
+                                                      record_message.record[
+                                                          replication_key])
+                    if rows_saved % 1000 == 0:
+                        # LOGGER.info(f"rows saved: {rows_saved}")
+                        yield singer.StateMessage(value=copy.deepcopy(state))
+        except Exception as e:
+            LOGGER.error(f'Exception in sync_table metrics/cursor loop: {type(e).__name__}: {e}')
+            LOGGER.error(traceback.format_exc())
+            raise
 
         if not replication_key:
             yield activate_version_message
@@ -481,11 +502,23 @@ def coerce_datetime(o):
 
 def do_sync(conn, db_name, db_schema, catalog, state):
     LOGGER.info("Starting Redshift sync")
-    for message in generate_messages(conn, db_name, db_schema, catalog, state):
-        sys.stdout.write(json.dumps(message.asdict(),
-                                    default=coerce_datetime,
-                                    use_decimal=True) + '\n')
-        sys.stdout.flush()
+    try:
+        for message in generate_messages(conn, db_name, db_schema, catalog, state):
+            # LOGGER.info(f"Writing message type: {type(message).__name__}")  # INFO not debug
+            sys.stdout.write(json.dumps(message.asdict(),
+                                        default=coerce_datetime,
+                                        use_decimal=True) + '\n')
+            # LOGGER.info("About to flush stdout")  # ADD THIS
+            sys.stdout.flush()
+            # LOGGER.info("Flush complete")  # ADD THIS
+    except BrokenPipeError:
+        LOGGER.error("BrokenPipeError: loader closed the pipe")
+        raise
+    except Exception as e:
+        LOGGER.error(f"Error during sync: {type(e).__name__}: {e}")
+        import traceback
+        LOGGER.error(traceback.format_exc())
+        raise
     LOGGER.info("Completed sync")
 
 
@@ -539,7 +572,23 @@ def build_state(raw_state, catalog):
     return state
 
 
+def setup_signal_handlers():
+    """Set up signal handlers to log when signals are received."""
+    def signal_handler(signum, frame):
+        LOGGER.error(f'Received signal {signum}')
+        LOGGER.error(''.join(traceback.format_stack(frame)))
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    # SIGPIPE is common in pipe situations
+    try:
+        signal.signal(signal.SIGPIPE, signal_handler)
+    except AttributeError:
+        pass  # SIGPIPE doesn't exist on Windows
+
+
 def main_impl():
+    setup_signal_handlers()
     args = utils.parse_args(REQUIRED_CONFIG_KEYS)
     CONFIG.update(args.config)
     connection = open_connection(args.config)
