@@ -398,9 +398,14 @@ def sync_table(connection, catalog_entry, state):
 
             if entry_schema.properties[replication_key].format == 'date-time':
                 replication_key_value = pendulum.parse(replication_key_value)
-
-            select += ' WHERE {} > %(replication_key_value)s ORDER BY {} ' \
-                      'ASC'.format(replication_key, replication_key)
+                # Also include records with NULL or "zero" datetime values (e.g., 0001-01-01)
+                # These are often placeholder/default dates that should always be synced
+                select += ' WHERE ("{}" > %(replication_key_value)s OR "{}" < %(zero_datetime)s OR "{}" IS NULL) ORDER BY "{}" ' \
+                          'ASC'.format(replication_key, replication_key, replication_key, replication_key)
+                params['zero_datetime'] = datetime.datetime(1, 1, 2)  # Captures dates like 0001-01-01
+            else:
+                select += ' WHERE "{}" > %(replication_key_value)s ORDER BY "{}" ' \
+                          'ASC'.format(replication_key, replication_key)
             params['replication_key_value'] = replication_key_value
 
         elif replication_key is not None:
