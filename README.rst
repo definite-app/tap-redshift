@@ -18,6 +18,8 @@ This fork currently:
 Usage
 =====
 tap-redshift assumes you have a connection to Redshift and requires Python 3.6+.
+IMPORTANT: Incremental replication only works for datetime-like fields. If you are using a non-datetime-like field as the replication key, you will need to use full table replication.
+Attempting to use an non-datetime-like field as the replication key may result in unexpected behavior.
 
 Step 1: Create a configuration file
 -----------------------------------
